@@ -11,6 +11,9 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"github.com/aaaton/golem/v4"
+	"github.com/aaaton/golem/v4/dicts/en"
 )
 
 // streams bz2 chunk from ~25gb compressed file
@@ -62,7 +65,7 @@ func isValid(tok string) bool {
 	return true
 }
 
-func processText(text string, word_wt int, tfm map[string]int, sb *strings.Builder) {
+func processText(text string, word_wt int, tfm map[string]int, sb *strings.Builder, lz *golem.Lemmatizer) {
 	for _, r := range text {
 		r = unicode.ToLower(r)
 		if unicode.IsLetter(r) || unicode.IsNumber(r) {
@@ -71,6 +74,7 @@ func processText(text string, word_wt int, tfm map[string]int, sb *strings.Build
 			// words in page.Title receive more freq to be used in ranking later
 			token := sb.String()
 			if isValid(token) {
+				token = lz.Lemma(token)
 				tfm[token] += word_wt
 				sb.Reset()
 			}
@@ -79,11 +83,12 @@ func processText(text string, word_wt int, tfm map[string]int, sb *strings.Build
 	// process last rune
 	token := sb.String()
 	if isValid(token) {
+		token = lz.Lemma(token)
 		tfm[token] += word_wt
 	}
 }
 
-func worker(id int, pages chan Page, wg *sync.WaitGroup, debug bool, proc_pg chan ProcessedPage) {
+func worker(id int, pages chan Page, wg *sync.WaitGroup, debug bool, proc_pg chan ProcessedPage, lz *golem.Lemmatizer) {
 	if debug {
 		log.Printf("worker %d processing page", id)
 	}
@@ -104,13 +109,13 @@ func worker(id int, pages chan Page, wg *sync.WaitGroup, debug bool, proc_pg cha
 			FreqMap: termFreqMap,
 		}
 
-		processText(page.Title, 3, termFreqMap, &sb)
-		processText(page.Revision.Text, 1, termFreqMap, &sb)
+		processText(page.Title, 3, termFreqMap, &sb, lz)
+		processText(page.Revision.Text, 1, termFreqMap, &sb, lz)
 		proc_pg <- pp
 	}
 }
 
-func Tokenize(file string) {
+func Tokenize(file string, proc_pgPool chan ProcessedPage) {
 	f, err := os.Open(file)
 	if err != nil {
 		panic(err)
@@ -119,18 +124,21 @@ func Tokenize(file string) {
 
 	bz2R := bzip2.NewReader(f)
 	xmlD := xml.NewDecoder(bz2R)
+	lemmatizer, err := golem.New(en.New())
+	if err != nil {
+		panic(err)
+	}
 
 	pages := 0
 	now := time.Now()
 
 	n := runtime.NumCPU()
 
-	pagePool := make(chan Page, n*2)
-	proc_pgPool := make(chan ProcessedPage, 100)
+	pagePool := make(chan Page, 100)
 	var wg sync.WaitGroup
 	wg.Add(n * 2)
 	for id := range n * 2 {
-		go worker(id, pagePool, &wg, false, proc_pgPool)
+		go worker(id, pagePool, &wg, false, proc_pgPool, lemmatizer)
 	}
 
 	go func() {
@@ -173,6 +181,7 @@ func Tokenize(file string) {
 	}
 	close(pagePool)
 	wg.Wait()
+	close(proc_pgPool)
 	elapsed := time.Since(now)
 	log.Printf("Processed %d pages in %v sec", pages, elapsed.Seconds())
 }
