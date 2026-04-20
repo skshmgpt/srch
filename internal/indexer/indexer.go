@@ -7,14 +7,14 @@ import (
 	"github.com/skshmgpt/srch/internal/tokenizer"
 )
 
-// read from a pool of processed pages
+// read from a pool of processed Docs
 // build posting
 // write to an in-memory map
 //
 
 type PostingList struct {
-	DocIDS []byte
-	Freqs  []uint32
+	PageIDS []byte
+	Freqs   []byte
 }
 
 type Index struct {
@@ -22,15 +22,15 @@ type Index struct {
 	Df           map[string]int
 	PageCount    int
 	PageLen      map[int]int
-	TotalpageLen int
+	TotalPageLen int
 }
 
 type Posting struct {
-	docID uint32
-	freq  uint32
+	pageID uint32
+	freq   uint32
 }
 
-func BuildIndex(proc_pagePool <-chan tokenizer.ProcessedPage) *Index {
+func BuildIndex(proc_DocPool <-chan tokenizer.ProcessedPage) *Index {
 
 	index := Index{
 		InvIdx:  make(map[string]*PostingList),
@@ -40,47 +40,48 @@ func BuildIndex(proc_pagePool <-chan tokenizer.ProcessedPage) *Index {
 
 	tempIdx := make(map[string][]Posting)
 
-	for pp := range proc_pagePool {
+	for pp := range proc_DocPool {
 		tf := 0
 		for term, freq := range pp.FreqMap {
 			tempIdx[term] = append(tempIdx[term], Posting{
-				docID: uint32(pp.ID),
-				freq:  uint32(freq),
+				pageID: uint32(pp.ID),
+				freq:   uint32(freq),
 			})
 			index.Df[term]++
 			tf += freq
 		}
 		index.PageCount++
 		index.PageLen[pp.ID] = tf
-		index.TotalpageLen += tf
+		index.TotalPageLen += tf
 	}
 
 	for term, pArr := range tempIdx {
 		sort.Slice(pArr, func(i, j int) bool {
-			return pArr[i].docID < pArr[j].docID
+			return pArr[i].pageID < pArr[j].pageID
 		})
 
 		for i := len(pArr) - 1; i > 0; i-- {
-			pArr[i].docID = pArr[i].docID - pArr[i-1].docID
+			pArr[i].pageID = pArr[i].pageID - pArr[i-1].pageID
 		}
 
-		compressedDocIDS := make([]byte, 0, len(pArr)*2)
-		freqs := make([]uint32, len(pArr))
+		compressedPageIDS := make([]byte, 0, len(pArr)*2)
+		compressedFreqs := make([]byte, 0, len(pArr)*2)
 		buf := make([]byte, binary.MaxVarintLen64)
 
-		for i, d := range pArr {
-			n := binary.PutUvarint(buf, uint64(d.docID))
-			compressedDocIDS = append(compressedDocIDS, buf[:n]...)
-			freqs[i] = pArr[i].freq
+		for _, d := range pArr {
+			n := binary.PutUvarint(buf, uint64(d.pageID))
+			compressedPageIDS = append(compressedPageIDS, buf[:n]...)
+			n = binary.PutUvarint(buf, uint64(d.freq))
+			compressedFreqs = append(compressedFreqs, buf[:n]...)
 		}
 
 		index.InvIdx[term] = &PostingList{
-			DocIDS: compressedDocIDS,
-			Freqs:  freqs,
+			PageIDS: compressedPageIDS,
+			Freqs:   compressedFreqs,
 		}
-		clear(compressedDocIDS)
-		clear(freqs)
+
 	}
+	clear(tempIdx)
 
 	return &index
 

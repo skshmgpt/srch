@@ -9,7 +9,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"time"
 	"unicode"
 
 	"github.com/aaaton/golem/v4"
@@ -18,8 +17,8 @@ import (
 
 // streams bz2 chunk from ~25gb compressed file
 // decompress chunk
-// parse xml -> build page
-// hand over a page to a worker
+// parse xml -> build Doc
+// hand over a Doc to a worker
 // worker loops over all the text:
 // 1. normalization
 // 2. stop word removal
@@ -71,7 +70,7 @@ func processText(text string, word_wt int, tfm map[string]int, sb *strings.Build
 		if unicode.IsLetter(r) || unicode.IsNumber(r) {
 			sb.WriteRune(r)
 		} else {
-			// words in page.Title receive more freq to be used in ranking later
+			// words in Doc.Title receive more freq to be used in ranking later
 			token := sb.String()
 			if isValid(token) {
 				token = lz.Lemma(token)
@@ -90,7 +89,7 @@ func processText(text string, word_wt int, tfm map[string]int, sb *strings.Build
 
 func worker(id int, pages chan Page, wg *sync.WaitGroup, debug bool, proc_pg chan ProcessedPage, lz *golem.Lemmatizer) {
 	if debug {
-		log.Printf("worker %d processing page", id)
+		log.Printf("worker %d processing Doc", id)
 	}
 	defer wg.Done()
 
@@ -129,27 +128,14 @@ func Tokenize(file string, proc_pgPool chan ProcessedPage) {
 		panic(err)
 	}
 
-	pages := 0
-	now := time.Now()
-
 	n := runtime.NumCPU()
 
-	pagePool := make(chan Page, 100)
+	page_pool := make(chan Page, 100)
 	var wg sync.WaitGroup
 	wg.Add(n * 2)
 	for id := range n * 2 {
-		go worker(id, pagePool, &wg, false, proc_pgPool, lemmatizer)
+		go worker(id, page_pool, &wg, false, proc_pgPool, lemmatizer)
 	}
-
-	go func() {
-		for range proc_pgPool {
-			// log.Println("\n\n", pp.ID)
-			// for k, v := range pp.FreqMap {
-			// 	log.Printf("%s : %d\n", k, v)
-			// }
-			// log.Print("\n\n")
-		}
-	}()
 
 	for {
 		tok, err := xmlD.Token()
@@ -175,13 +161,10 @@ func Tokenize(file string, proc_pgPool chan ProcessedPage) {
 
 			// buffered channel creates automatic backpressure and pauses the stream
 			// until page pool is free
-			pages++
-			pagePool <- p
+			page_pool <- p
 		}
 	}
-	close(pagePool)
+	close(page_pool)
 	wg.Wait()
 	close(proc_pgPool)
-	elapsed := time.Since(now)
-	log.Printf("Processed %d pages in %v sec", pages, elapsed.Seconds())
 }
