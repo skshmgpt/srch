@@ -2,5 +2,9 @@ github.com/aaaton/golem/v4 v4.0.0 h1:YHieBS+5Fqir298nJ7fk3EvMcKM/+T5gpMRt4TIAiZ8
 github.com/aaaton/golem/v4 v4.0.0/go.mod h1:OfK/S5v9Exsx1yO21WorREuIVV+Y5K2hygP0A9oJCCI=
 github.com/aaaton/golem/v4/dicts/en v1.0.1 h1:/BsOsh8JTgTkuevwM9axPnAi9CD4rK7TWHNdW/6V3Uo=
 github.com/aaaton/golem/v4/dicts/en v1.0.1/go.mod h1:1YKRrQNng+KbS+peA7sj3TIa8eqR6T2UqdJ+Tc9xeoA=
+github.com/d4l3k/go-pbzip2 v0.0.0-20181117060939-9d7e0c2f0367 h1:YMIB1vR1n4Iq5NiedOr84ebdgRopOwyV4pi0+bASF6k=
+github.com/d4l3k/go-pbzip2 v0.0.0-20181117060939-9d7e0c2f0367/go.mod h1:5R0qKwQo+560NJ1zRw/QRl3FESLRA0dqYiE9caCJEww=
 github.com/go-playground/locales v0.14.1 h1:EWaQ/wswjilfKLTECiXz7Rh+3BjFhfDFKv/oXslEjJA=
 github.com/go-playground/locales v0.14.1/go.mod h1:hxrqLVvrK65+Rwrd5Fc6F2O76J/NuW9t0sjnWqG1slY=
+github.com/pkg/errors v0.9.1 h1:FEBLx1zS214owpjy7qsBeixbURkuhQAwrK5UwLGTwt4=
+github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=

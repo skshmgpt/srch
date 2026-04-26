@@ -1,18 +1,20 @@
 package tokenizer
 
 import (
-	"compress/bzip2"
 	"encoding/xml"
 	"io"
 	"log"
 	"os"
-	"runtime"
-	"strings"
 	"sync"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/aaaton/golem/v4"
 	"github.com/aaaton/golem/v4/dicts/en"
+	"github.com/d4l3k/go-pbzip2"
+	"github.com/skshmgpt/srch/internal"
+	"github.com/skshmgpt/srch/internal/preprocessor"
+	"github.com/skshmgpt/srch/internal/storage"
 )
 
 // streams bz2 chunk from ~25gb compressed file
@@ -27,20 +29,6 @@ import (
 // build a term frequency map for each document
 // write the result to a global channel
 //
-
-type Page struct {
-	Title    string `xml:"title"`
-	NS       int    `xml:"ns"`
-	ID       int    `xml:"id"`
-	Revision struct {
-		Text string `xml:"text"`
-	} `xml:"revision"`
-}
-
-type ProcessedPage struct {
-	ID      int
-	FreqMap map[string]int
-}
 
 var stopWords = map[string]struct{}{
 	"a": {}, "an": {}, "the": {}, "and": {}, "or": {}, "but": {},
@@ -64,77 +52,107 @@ func isValid(tok string) bool {
 	return true
 }
 
-func processText(text string, word_wt int, tfm map[string]int, sb *strings.Builder, lz *golem.Lemmatizer) {
+// processText tokenizes text into tfm and returns the number of valid tokens
+// it added (after stop-word + length filtering). The return value is the
+// "field length" used by BM25 / BM25F at query time.
+func processText(text string, tfm map[string]uint32, buf *[]byte, lz *golem.Lemmatizer) uint32 {
+	var n uint32
 	for _, r := range text {
 		r = unicode.ToLower(r)
 		if unicode.IsLetter(r) || unicode.IsNumber(r) {
-			sb.WriteRune(r)
+			*buf = utf8.AppendRune(*buf, r)
 		} else {
-			// words in Doc.Title receive more freq to be used in ranking later
-			token := sb.String()
+			token := string(*buf)
 			if isValid(token) {
-				token = lz.Lemma(token)
-				tfm[token] += word_wt
-				sb.Reset()
+				tfm[lz.LemmaLower(token)]++
+				n++
 			}
+			*buf = (*buf)[:0]
 		}
 	}
-	// process last rune
-	token := sb.String()
+	token := string(*buf)
 	if isValid(token) {
-		token = lz.Lemma(token)
-		tfm[token] += word_wt
+		tfm[lz.LemmaLower(token)]++
+		n++
 	}
+	*buf = (*buf)[:0]
+	return n
 }
 
-func worker(id int, pages chan Page, wg *sync.WaitGroup, debug bool, proc_pg chan ProcessedPage, lz *golem.Lemmatizer) {
+// mergeFields produces one TermFreq per unique term across the title/body
+// maps. Terms only in title get FreqBody=0 (and vice versa). Body is iterated
+// first because it's typically the larger map; terms also present in title
+// are deleted so the second loop emits only title-only terms.
+func mergeFields(tfTitle, tfBody map[string]uint32) []internal.TermFreq {
+	out := make([]internal.TermFreq, 0, len(tfBody)+len(tfTitle))
+	for term, fb := range tfBody {
+		ft := tfTitle[term]
+		out = append(out, internal.TermFreq{Term: term, FreqTitle: ft, FreqBody: fb})
+		if ft != 0 {
+			delete(tfTitle, term)
+		}
+	}
+	for term, ft := range tfTitle {
+		out = append(out, internal.TermFreq{Term: term, FreqTitle: ft})
+	}
+	return out
+}
+
+func worker(id int, Docs chan internal.Doc, debug bool, proc_pg chan internal.ProcessedDoc, lz *golem.Lemmatizer) {
 	if debug {
 		log.Printf("worker %d processing Doc", id)
 	}
-	defer wg.Done()
 
-	sb := strings.Builder{}
+	buf := make([]byte, 0, 64)
 
-	for page := range pages {
-		sb.Reset()
+	for Doc := range Docs {
 		if debug {
-			log.Printf("processing page %s(%d)", page.Title, page.ID)
+			log.Printf("processing Doc %s(%d)", Doc.Title, Doc.ID)
 		}
 
-		termFreqMap := make(map[string]int, 100)
+		// Two maps keep title and body counts cleanly separable; merged once
+		// per doc into the per-field TermFreq slice the indexer expects.
+		tfTitle := make(map[string]uint32, 16)
+		tfBody := make(map[string]uint32, 100)
 
-		pp := ProcessedPage{
-			ID:      page.ID,
-			FreqMap: termFreqMap,
+		titleLen := processText(Doc.Title, tfTitle, &buf, lz)
+		bodyLen := processText(preprocessor.Strip(Doc.Revision.Text), tfBody, &buf, lz)
+
+		proc_pg <- internal.ProcessedDoc{
+			ID:       Doc.ID,
+			TitleLen: titleLen,
+			BodyLen:  bodyLen,
+			Terms:    mergeFields(tfTitle, tfBody),
 		}
-
-		processText(page.Title, 3, termFreqMap, &sb, lz)
-		processText(page.Revision.Text, 1, termFreqMap, &sb, lz)
-		proc_pg <- pp
 	}
 }
 
-func Tokenize(file string, proc_pgPool chan ProcessedPage) {
+func Tokenize(workers int, file string, proc_pgPool chan internal.ProcessedDoc) {
+
+	lastIndexedDocID := storage.ReadCheckPoint()
+
 	f, err := os.Open(file)
 	if err != nil {
 		panic(err)
 	}
 	defer f.Close()
 
-	bz2R := bzip2.NewReader(f)
+	bz2R, err := pbzip2.NewReader(f)
+	if err != nil {
+		panic(err)
+	}
 	xmlD := xml.NewDecoder(bz2R)
 	lemmatizer, err := golem.New(en.New())
 	if err != nil {
 		panic(err)
 	}
 
-	n := runtime.NumCPU()
-
-	page_pool := make(chan Page, 100)
+	Doc_pool := make(chan internal.Doc, 5000)
 	var wg sync.WaitGroup
-	wg.Add(n * 2)
-	for id := range n * 2 {
-		go worker(id, page_pool, &wg, false, proc_pgPool, lemmatizer)
+	for i := range workers {
+		wg.Go(func() {
+			worker(i, Doc_pool, false, proc_pgPool, lemmatizer)
+		})
 	}
 
 	for {
@@ -151,7 +169,7 @@ func Tokenize(file string, proc_pgPool chan ProcessedPage) {
 		}
 
 		if start.Name.Local == "page" {
-			var p Page
+			var p internal.Doc
 			if err := xmlD.DecodeElement(&p, &start); err != nil {
 				panic(err)
 			}
@@ -159,12 +177,16 @@ func Tokenize(file string, proc_pgPool chan ProcessedPage) {
 				continue
 			}
 
+			if uint64(p.ID) < lastIndexedDocID {
+				continue
+			}
+
 			// buffered channel creates automatic backpressure and pauses the stream
-			// until page pool is free
-			page_pool <- p
+			// until Doc pool is free
+			Doc_pool <- p
 		}
 	}
-	close(page_pool)
+	close(Doc_pool)
 	wg.Wait()
 	close(proc_pgPool)
 }

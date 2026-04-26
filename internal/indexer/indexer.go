@@ -1,88 +1,147 @@
 package indexer
 
 import (
-	"encoding/binary"
-	"sort"
+	"log"
+	"os"
+	"sync"
+	"time"
 
-	"github.com/skshmgpt/srch/internal/tokenizer"
+	"github.com/skshmgpt/srch/internal"
+	"github.com/skshmgpt/srch/internal/storage"
 )
 
 // read from a pool of processed Docs
 // build posting
-// write to an in-memory map
+// using the storeindexpart api, writes index for a subset of Docs
+// store the meta of the
 //
 
-type PostingList struct {
-	PageIDS []byte
-	Freqs   []byte
-}
-
-type Index struct {
-	InvIdx       map[string]*PostingList
-	Df           map[string]int
-	PageCount    int
-	PageLen      map[int]int
-	TotalPageLen int
-}
-
-type Posting struct {
-	pageID uint32
-	freq   uint32
-}
-
-func BuildIndex(proc_DocPool <-chan tokenizer.ProcessedPage) *Index {
-
-	index := Index{
-		InvIdx:  make(map[string]*PostingList),
-		Df:      make(map[string]int),
-		PageLen: make(map[int]int),
+func worker(batch Batch, id int, retryChan chan Batch) *internal.IdxSegment {
+	log.Printf("worker %d processing batch %d\n", id, batch.ID)
+	start := time.Now()
+	idx := internal.Index{
+		InvIdx:   make(map[string]*internal.PostingList),
+		Df:       make(map[string]uint32),
+		DocCount: uint64(len(batch.Docs)),
+		DocLen:   make(map[uint32]uint32),
 	}
 
-	tempIdx := make(map[string][]Posting)
+	termMap := make(map[string]uint32, 50000)
+	terms := make([]string, 0, 50000)
+	postings := make([]internal.PostingList, 0, 50000)
+	df := make([]uint32, 0, 50000)
 
-	for pp := range proc_DocPool {
-		tf := 0
-		for term, freq := range pp.FreqMap {
-			tempIdx[term] = append(tempIdx[term], Posting{
-				pageID: uint32(pp.ID),
-				freq:   uint32(freq),
-			})
-			index.Df[term]++
-			tf += freq
+	for _, p := range batch.Docs {
+		for _, tf := range p.Terms {
+			termId, ok := termMap[tf.Term]
+			if !ok {
+				termId = uint32(len(terms))
+				termMap[tf.Term] = termId
+				terms = append(terms, tf.Term)
+				postings = append(postings, internal.PostingList{
+					DocIDS:     make([]uint32, 0, 16),
+					FreqsTitle: make([]uint32, 0, 16),
+					FreqsBody:  make([]uint32, 0, 16),
+				})
+				df = append(df, 0)
+			}
+			pl := &postings[termId]
+			pl.DocIDS = append(pl.DocIDS, p.ID)
+			pl.FreqsTitle = append(pl.FreqsTitle, tf.FreqTitle)
+			pl.FreqsBody = append(pl.FreqsBody, tf.FreqBody)
+			df[termId]++
 		}
-		index.PageCount++
-		index.PageLen[pp.ID] = tf
-		index.TotalPageLen += tf
+		docLen := p.TitleLen + p.BodyLen
+		idx.DocLen[p.ID] = docLen
+		idx.TotalDoclen += uint64(docLen)
+		idx.TotalTitleLen += uint64(p.TitleLen)
+		idx.TotalBodyLen += uint64(p.BodyLen)
 	}
 
-	for term, pArr := range tempIdx {
-		sort.Slice(pArr, func(i, j int) bool {
-			return pArr[i].pageID < pArr[j].pageID
+	for termId, term := range terms {
+		idx.InvIdx[term] = &postings[termId]
+		idx.Df[term] = df[termId]
+	}
+	clear(termMap)
+	clear(terms)
+	clear(df)
+
+	dir, err := os.Getwd()
+	if err != nil {
+		panic(err)
+	}
+	// in indexer/indexer.go worker(), wrap the write call:
+	buildTime := time.Since(start)
+	t0 := time.Now()
+	meta, err := storage.WriteIdxPart(&idx, batch.ID, dir)
+	log.Printf("batch %d: build=%v write=%v terms=%d pages=%d", batch.ID, buildTime, time.Since(t0), len(idx.Df), len(batch.Docs))
+
+	if err != nil {
+		if batch.Retries >= 2 {
+			// skip batch
+			log.Printf("Error processing batch, max retries reached, skipping : worker %d, err : %v", id, err)
+		} else {
+			batch.Retries++
+			retryChan <- batch
+			log.Printf("Error processing batch : worker %d, err : %v", id, err)
+		}
+	}
+
+	return meta
+}
+
+type Batch struct {
+	ID      int
+	Docs    []internal.ProcessedDoc
+	Retries int
+}
+
+func Index(batchSize int, workers int, procPgPool <-chan internal.ProcessedDoc) {
+
+	var wg sync.WaitGroup
+	var b Batch
+	batchId := 1
+	b.Docs = make([]internal.ProcessedDoc, 0, batchSize)
+	batchChan := make(chan Batch, workers*2)
+	retryChan := make(chan Batch, workers*2)
+
+	go func() {
+		for b := range retryChan {
+			batchChan <- b
+		}
+	}()
+
+	for i := range workers {
+		wg.Go(func() {
+			for batch := range batchChan {
+				worker(batch, i, retryChan)
+			}
 		})
-
-		for i := len(pArr) - 1; i > 0; i-- {
-			pArr[i].pageID = pArr[i].pageID - pArr[i-1].pageID
-		}
-
-		compressedPageIDS := make([]byte, 0, len(pArr)*2)
-		compressedFreqs := make([]byte, 0, len(pArr)*2)
-		buf := make([]byte, binary.MaxVarintLen64)
-
-		for _, d := range pArr {
-			n := binary.PutUvarint(buf, uint64(d.pageID))
-			compressedPageIDS = append(compressedPageIDS, buf[:n]...)
-			n = binary.PutUvarint(buf, uint64(d.freq))
-			compressedFreqs = append(compressedFreqs, buf[:n]...)
-		}
-
-		index.InvIdx[term] = &PostingList{
-			PageIDS: compressedPageIDS,
-			Freqs:   compressedFreqs,
-		}
-
 	}
-	clear(tempIdx)
 
-	return &index
+	for p := range procPgPool {
+		b.Docs = append(b.Docs, p)
 
+		if len(b.Docs) == batchSize {
+			batchChan <- Batch{
+				ID:      batchId,
+				Docs:    append([]internal.ProcessedDoc(nil), b.Docs...),
+				Retries: b.Retries,
+			}
+			batchId++
+			b.Docs = make([]internal.ProcessedDoc, 0, batchSize)
+		}
+	}
+
+	if len(b.Docs) > 0 {
+		batchChan <- Batch{
+			ID:      batchId,
+			Docs:    append([]internal.ProcessedDoc(nil), b.Docs...),
+			Retries: b.Retries,
+		}
+	}
+
+	close(batchChan)
+	clear(b.Docs)
+	wg.Wait()
 }
